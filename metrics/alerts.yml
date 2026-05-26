@@ -1,0 +1,24 @@
+groups:
+  - name: stellar-router-alerts
+    interval: 30s
+    rules:
+      # Circuit Breaker Alerts
+      - alert: CircuitBreakerOpen
+        expr: router_middleware_circuit_open == 1
+        for: 1m
+        labels:
+          severity: warning
+          component: middleware
+        annotations:
+          summary: "Circuit breaker open for route {{ $labels.route }}"
+          description: "Circuit breaker has been open on route {{ $labels.route }} for more than 1 minute. This suggests repeated failures in the routed contract."
+
+      - alert: CircuitBreakerStuck
+        expr: router_middleware_circuit_open == 1
+        for: 5m
+        labels:
+          severity: critical
+          component: middleware
+        annotations:
+          summary: "Circuit breaker stuck open on route {{ $labels.route }}"
+          description: "Circuit breaker has been open on route {{ $labels.route }} for more than 5 minutes. Manual intervention may be required to reset the circuit."
