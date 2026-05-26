@@ -3,15 +3,13 @@
 //! # router-timelock
 //!
 //! Delayed execution queue for sensitive router configuration changes.
-//! Any proposed change must wait a configurable delay before it can be executed.
-//!
-//! ## Features
-//! - Queue arbitrary change proposals with a description
-//! - Configurable minimum delay (e.g. 24h)
-//! - Cancel queued operations before execution
-//! - Executed operations cannot be re-executed
+//! Operations must wait a configurable minimum delay before execution.
+//! Operations can be cancelled before execution.
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, crypto::Hash, Address, Bytes, Env,
+    String, Symbol, Vec,
+};
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -19,21 +17,17 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, 
 pub enum DataKey {
     Admin,
     MinDelay,
-    Operation(u64),   // op_id -> TimelockOp
-    NextOpId,
+    Op(Bytes), // op_id -> Op
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct TimelockOp {
-    pub id: u64,
+pub struct Op {
     pub proposer: Address,
     pub description: String,
-    /// Target contract address for the change
     pub target: Address,
-    /// Earliest timestamp at which this op can execute
     pub eta: u64,
     pub executed: bool,
     pub cancelled: bool,
@@ -48,10 +42,10 @@ pub enum TimelockError {
     NotInitialized = 2,
     Unauthorized = 3,
     NotFound = 4,
-    TooEarly = 5,
+    NotReady = 5,
     AlreadyExecuted = 6,
-    AlreadyCancelled = 7,
-    InvalidDelay = 8,
+    Cancelled = 7,
+    DelayTooShort = 8,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -61,28 +55,26 @@ pub struct RouterTimelock;
 
 #[contractimpl]
 impl RouterTimelock {
-    /// Initialize with admin and minimum delay in seconds.
+    /// Initialize with an admin and minimum delay (seconds).
     pub fn initialize(env: Env, admin: Address, min_delay: u64) -> Result<(), TimelockError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(TimelockError::AlreadyInitialized);
         }
-        if min_delay == 0 {
-            return Err(TimelockError::InvalidDelay);
-        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MinDelay, &min_delay);
-        env.storage().instance().set(&DataKey::NextOpId, &0u64);
         Ok(())
     }
 
-    /// Queue a new operation. Returns the operation ID.
+    /// Queue an operation. Returns the op_id (SHA-256 of description + target + eta).
+    /// Emits `op_queued` with `(op_id, target, eta)`.
     pub fn queue(
         env: Env,
         proposer: Address,
         description: String,
         target: Address,
         delay: u64,
-    ) -> Result<u64, TimelockError> {
+        _deps: Vec<Bytes>,
+    ) -> Result<Bytes, TimelockError> {
         proposer.require_auth();
         Self::require_admin(&env, &proposer)?;
 
@@ -93,106 +85,120 @@ impl RouterTimelock {
             .ok_or(TimelockError::NotInitialized)?;
 
         if delay < min_delay {
-            return Err(TimelockError::InvalidDelay);
+            return Err(TimelockError::DelayTooShort);
         }
-
-        let op_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextOpId)
-            .unwrap_or(0);
 
         let eta = env.ledger().timestamp() + delay;
 
-        let op = TimelockOp {
-            id: op_id,
+        // Derive op_id from description bytes + target bytes + eta
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&description.to_bytes());
+        preimage.append(&target.clone().to_xdr(&env));
+        let eta_bytes = eta.to_be_bytes();
+        preimage.append(&Bytes::from_array(&env, &eta_bytes));
+
+        let op_id: Bytes = env.crypto().sha256(&preimage).into();
+
+        let op = Op {
             proposer,
             description,
-            target,
+            target: target.clone(),
             eta,
             executed: false,
             cancelled: false,
         };
+        env.storage()
+            .instance()
+            .set(&DataKey::Op(op_id.clone()), &op);
 
-        env.storage().instance().set(&DataKey::Operation(op_id), &op);
-        env.storage().instance().set(&DataKey::NextOpId, &(op_id + 1));
+        env.events().publish(
+            (Symbol::new(&env, "op_queued"),),
+            (op_id.clone(), target, eta),
+        );
 
         Ok(op_id)
     }
 
-    /// Execute a queued operation after its delay has elapsed.
-    pub fn execute(env: Env, caller: Address, op_id: u64) -> Result<(), TimelockError> {
+    /// Cancel a queued operation before it is executed.
+    pub fn cancel(env: Env, caller: Address, op_id: Bytes) -> Result<(), TimelockError> {
         caller.require_auth();
         Self::require_admin(&env, &caller)?;
 
-        let mut op: TimelockOp = env
+        let mut op: Op = env
             .storage()
             .instance()
-            .get(&DataKey::Operation(op_id))
+            .get(&DataKey::Op(op_id.clone()))
             .ok_or(TimelockError::NotFound)?;
 
         if op.executed {
             return Err(TimelockError::AlreadyExecuted);
         }
         if op.cancelled {
-            return Err(TimelockError::AlreadyCancelled);
-        }
-        if env.ledger().timestamp() < op.eta {
-            return Err(TimelockError::TooEarly);
-        }
-
-        op.executed = true;
-        env.storage().instance().set(&DataKey::Operation(op_id), &op);
-
-        Ok(())
-    }
-
-    /// Cancel a queued operation before it executes.
-    pub fn cancel(env: Env, caller: Address, op_id: u64) -> Result<(), TimelockError> {
-        caller.require_auth();
-        Self::require_admin(&env, &caller)?;
-
-        let mut op: TimelockOp = env
-            .storage()
-            .instance()
-            .get(&DataKey::Operation(op_id))
-            .ok_or(TimelockError::NotFound)?;
-
-        if op.executed {
-            return Err(TimelockError::AlreadyExecuted);
-        }
-        if op.cancelled {
-            return Err(TimelockError::AlreadyCancelled);
+            return Err(TimelockError::Cancelled);
         }
 
         op.cancelled = true;
-        env.storage().instance().set(&DataKey::Operation(op_id), &op);
+        env.storage()
+            .instance()
+            .set(&DataKey::Op(op_id.clone()), &op);
+
+        env.events()
+            .publish((Symbol::new(&env, "op_cancelled"),), op_id);
 
         Ok(())
     }
 
-    /// Get an operation by ID.
-    pub fn get_op(env: Env, op_id: u64) -> Option<TimelockOp> {
-        env.storage().instance().get(&DataKey::Operation(op_id))
+    /// Execute a queued operation after its ETA has passed.
+    pub fn execute(env: Env, caller: Address, op_id: Bytes) -> Result<(), TimelockError> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        let mut op: Op = env
+            .storage()
+            .instance()
+            .get(&DataKey::Op(op_id.clone()))
+            .ok_or(TimelockError::NotFound)?;
+
+        if op.cancelled {
+            return Err(TimelockError::Cancelled);
+        }
+        if op.executed {
+            return Err(TimelockError::AlreadyExecuted);
+        }
+        if env.ledger().timestamp() < op.eta {
+            return Err(TimelockError::NotReady);
+        }
+
+        op.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Op(op_id.clone()), &op);
+
+        env.events()
+            .publish((Symbol::new(&env, "op_executed"),), (op_id, op.target));
+
+        Ok(())
+    }
+
+    /// Get an operation by id.
+    pub fn get_op(env: Env, op_id: Bytes) -> Option<Op> {
+        env.storage().instance().get(&DataKey::Op(op_id))
     }
 
     /// Get the minimum delay.
-    pub fn min_delay(env: Env) -> Result<u64, TimelockError> {
+    pub fn min_delay(env: Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::MinDelay)
-            .ok_or(TimelockError::NotInitialized)
+            .unwrap_or(0)
     }
 
-    /// Update the minimum delay.
-    pub fn set_min_delay(env: Env, caller: Address, new_delay: u64) -> Result<(), TimelockError> {
-        caller.require_auth();
-        Self::require_admin(&env, &caller)?;
-        if new_delay == 0 {
-            return Err(TimelockError::InvalidDelay);
-        }
-        env.storage().instance().set(&DataKey::MinDelay, &new_delay);
-        Ok(())
+    /// Get the admin.
+    pub fn admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized")
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -216,12 +222,14 @@ impl RouterTimelock {
 mod tests {
     extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Events, Ledger},
+        Bytes, Env, IntoVal, String,
+    };
 
     fn setup() -> (Env, Address, RouterTimelockClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 1000);
         let contract_id = env.register_contract(None, RouterTimelock);
         let client = RouterTimelockClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -230,57 +238,117 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_and_execute() {
+    fn test_queue_returns_op_id() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
-        env.ledger().with_mut(|l| l.timestamp += 3601);
+        let deps = Vec::new(&env);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        assert!(!op_id.is_empty());
+    }
+
+    #[test]
+    fn test_queue_emits_op_queued_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+
+        // Topic is "op_queued"
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_queued"));
+
+        // Payload is (op_id, target, eta)
+        let (emitted_id, emitted_target, emitted_eta): (Bytes, Address, u64) =
+            last.2.into_val(&env);
+        assert_eq!(emitted_id, op_id);
+        assert_eq!(emitted_target, target);
+        assert!(emitted_eta > 0);
+    }
+
+    #[test]
+    fn test_queue_stores_op() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        let op = client.get_op(&op_id).unwrap();
+
+        assert_eq!(op.target, target);
+        assert!(!op.executed);
+        assert!(!op.cancelled);
+    }
+
+    #[test]
+    fn test_execute_before_eta_fails() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         let result = client.try_execute(&admin, &op_id);
-        assert!(result.is_ok());
+        assert_eq!(result, Err(Ok(TimelockError::NotReady)));
+    }
+
+    #[test]
+    fn test_execute_after_eta_succeeds() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op_id);
+
         let op = client.get_op(&op_id).unwrap();
         assert!(op.executed);
     }
 
     #[test]
-    fn test_execute_too_early_fails() {
+    fn test_cancel_op() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
-        let result = client.try_execute(&admin, &op_id);
-        assert_eq!(result, Err(Ok(TimelockError::TooEarly)));
-    }
+        let deps = Vec::new(&env);
 
-    #[test]
-    fn test_cancel_operation() {
-        let (env, admin, client) = setup();
-        let target = Address::generate(&env);
-        let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         client.cancel(&admin, &op_id);
+
         let op = client.get_op(&op_id).unwrap();
         assert!(op.cancelled);
     }
 
     #[test]
-    fn test_execute_cancelled_fails() {
+    fn test_execute_cancelled_op_fails() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         client.cancel(&admin, &op_id);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         let result = client.try_execute(&admin, &op_id);
-        assert_eq!(result, Err(Ok(TimelockError::AlreadyCancelled)));
+        assert_eq!(result, Err(Ok(TimelockError::Cancelled)));
     }
 
     #[test]
-    fn test_double_execute_fails() {
+    fn test_execute_twice_fails() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let op_id = client.queue(&admin, &desc, &target, &3600);
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
         env.ledger().with_mut(|l| l.timestamp += 3601);
         client.execute(&admin, &op_id);
         let result = client.try_execute(&admin, &op_id);
@@ -288,12 +356,14 @@ mod tests {
     }
 
     #[test]
-    fn test_delay_below_minimum_fails() {
+    fn test_delay_too_short_fails() {
         let (env, admin, client) = setup();
         let target = Address::generate(&env);
         let desc = String::from_str(&env, "upgrade oracle");
-        let result = client.try_queue(&admin, &desc, &target, &100);
-        assert_eq!(result, Err(Ok(TimelockError::InvalidDelay)));
+        let deps = Vec::new(&env);
+        // min_delay is 3600, passing 100 should fail
+        let result = client.try_queue(&admin, &desc, &target, &100, &deps);
+        assert_eq!(result, Err(Ok(TimelockError::DelayTooShort)));
     }
 
     #[test]
@@ -301,8 +371,42 @@ mod tests {
         let (env, _admin, client) = setup();
         let attacker = Address::generate(&env);
         let target = Address::generate(&env);
-        let desc = String::from_str(&env, "malicious");
-        let result = client.try_queue(&attacker, &desc, &target, &3600);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+        let result = client.try_queue(&attacker, &desc, &target, &3600, &deps);
         assert_eq!(result, Err(Ok(TimelockError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_execute_emits_op_executed_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        env.ledger().with_mut(|l| l.timestamp += 3601);
+        client.execute(&admin, &op_id);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_executed"));
+    }
+
+    #[test]
+    fn test_cancel_emits_op_cancelled_event() {
+        let (env, admin, client) = setup();
+        let target = Address::generate(&env);
+        let desc = String::from_str(&env, "upgrade oracle");
+        let deps = Vec::new(&env);
+
+        let op_id = client.queue(&admin, &desc, &target, &3600, &deps);
+        client.cancel(&admin, &op_id);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let topic: Symbol = last.1.get(0).unwrap().into_val(&env);
+        assert_eq!(topic, Symbol::new(&env, "op_cancelled"));
     }
 }
