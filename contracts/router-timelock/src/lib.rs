@@ -17,6 +17,13 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     MinDelay,
+    Operation(u64), // op_id -> TimelockOp
+    NextOpId,
+    FastTrackEnabled,
+    OperationDeps(u64),      // op_id -> Vec<u64>
+    EmergencyCouncil,        // Vec<Address>
+    RequiredApprovals,       // u32 (M in M-of-N)
+    FastTrackApprovals(u64), // op_id -> Vec<Address> (who has approved)
     Op(Bytes), // op_id -> Op
 }
 
