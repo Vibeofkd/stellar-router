@@ -949,6 +949,54 @@ mod tests {
         assert!(client.has_role(&user, &role));
     }
 
+    // ── Issue #443: blacklist expires_at ──────────────────────────────────────
+
+    #[test]
+    fn test_blacklist_expires_after_timestamp() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        // Blacklist with expiry 100 seconds from now (ledger timestamp starts at 0)
+        client.blacklist(&admin, &user, &None::<String>, &Some(100u64));
+        assert!(client.is_blacklisted(&user));
+
+        // Advance time past expiry
+        env.ledger().set_timestamp(101);
+        // Expired blacklist should be treated as not blacklisted
+        assert!(!client.is_blacklisted(&user));
+    }
+
+    #[test]
+    fn test_blacklist_without_expiry_is_permanent() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        client.blacklist(&admin, &user, &None::<String>, &None);
+        assert!(client.is_blacklisted(&user));
+
+        // Advance time significantly — should still be blacklisted
+        env.ledger().set_timestamp(999_999);
+        assert!(client.is_blacklisted(&user));
+    }
+
+    #[test]
+    fn test_expired_blacklist_allows_role_grant() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+
+        // Blacklist with short expiry
+        client.blacklist(&admin, &user, &None::<String>, &Some(50u64));
+        assert!(client.is_blacklisted(&user));
+
+        // Advance past expiry
+        env.ledger().set_timestamp(51);
+        assert!(!client.is_blacklisted(&user));
+
+        // Should now be able to grant role
+        assert!(client.try_grant_role(&admin, &user, &role, &None).is_ok());
+    }
+
     #[test]
     fn test_get_roles_for_address_populated_after_grant() {
         let (env, admin, client) = setup();
