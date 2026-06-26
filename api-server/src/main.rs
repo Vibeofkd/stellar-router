@@ -8,16 +8,22 @@ mod websocket;
 mod tests;
 
 use anyhow::{Context, Result};
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+    Router,
+};
 use clap::Parser;
 use std::net::SocketAddr;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::state::AppState;
 
 #[derive(Parser, Debug)]
 #[command(name = "router-api-server")]
-#[command(about = "API server for stellar-router with transaction simulation and WebSocket tracking")]
+#[command(
+    about = "API server for stellar-router with transaction simulation and WebSocket tracking"
+)]
 struct Args {
     /// Listen address (default: 127.0.0.1:8080)
     #[arg(long, env = "LISTEN_ADDR", default_value = "127.0.0.1:8080")]
@@ -34,6 +40,10 @@ struct Args {
     /// Router core contract ID (for GET /routes)
     #[arg(long, env = "ROUTER_CORE_CONTRACT_ID", default_value = "")]
     router_core_contract_id: String,
+
+    /// Seconds to wait for in-flight requests to complete on shutdown (default: 30)
+    #[arg(long, env = "SHUTDOWN_TIMEOUT_SECS", default_value = "30")]
+    shutdown_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -74,7 +84,45 @@ async fn main() -> Result<()> {
     info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    let drain_timeout = std::time::Duration::from_secs(args.shutdown_timeout_secs);
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
+    match tokio::time::timeout(drain_timeout, serve).await {
+        Ok(result) => result?,
+        Err(_) => {
+            warn!(
+                "Graceful shutdown drain timed out after {}s, forcing exit",
+                args.shutdown_timeout_secs
+            );
+        }
+    }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Shutdown signal received, draining in-flight requests...");
 }
